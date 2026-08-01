@@ -15,7 +15,6 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}   # -> ghcr.io/p-org/p
 
 jobs:
   # Build each architecture natively (no QEMU) and push it by digest.
@@ -34,6 +33,16 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     steps:
+      # `github.repository` is `p-org/P`, but Docker/OCI reference names must be
+      # lowercase -- `ghcr.io/p-org/P` is rejected as an invalid reference.
+      # docker/metadata-action lowercases its own `images` input, but the
+      # by-digest push below (and the inspect in the merge job) do not go
+      # through it, so normalise the name once here and reuse it everywhere.
+      - name: Compute the image reference
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: echo "IMAGE=${REGISTRY}/${REPOSITORY,,}" >> "$GITHUB_ENV"
+
       - name: Checkout the repository
         uses: actions/checkout@v4
 
@@ -55,7 +64,7 @@ jobs:
           platforms: linux/${{ matrix.arch }}
           # Push an untagged, by-digest image; the manifest list is assembled
           # in the merge job below.
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
 
@@ -82,6 +91,12 @@ jobs:
       contents: read
       packages: write
     steps:
+      # Same lowercase normalisation as the build job -- see the comment there.
+      - name: Compute the image reference
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: echo "IMAGE=${REGISTRY}/${REPOSITORY,,}" >> "$GITHUB_ENV"
+
       - name: Download digests
         uses: actions/download-artifact@v4
         with:
@@ -103,12 +118,16 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.IMAGE }}
           # On release: tag with the semver from the release tag (git tags are
           # of the form `p-<version>`) plus a rolling `latest`. On manual runs:
           # honor the optional `tag` input.
+          #
+          # `type=match` takes no `event` qualifier (it is only meaningful for
+          # `type=ref`); it already applies only when the ref is a tag, which is
+          # the case for `release: published`.
           tags: |
-            type=match,pattern=p-(.*),group=1,event=tag
+            type=match,pattern=p-(.*),group=1
             type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' }}
             type=raw,value=latest
 
@@ -117,9 +136,9 @@ jobs:
         run: |
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+            $(printf "${IMAGE}@sha256:%s " *)
 
       - name: Inspect the published image
         run: |
           docker buildx imagetools inspect \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+            "${IMAGE}:${{ steps.meta.outputs.version }}"
